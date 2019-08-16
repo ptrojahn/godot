@@ -330,6 +330,7 @@ void CSGBrushOperation::BuildPoly::_clip_segment(const CSGBrush *p_brush, int p_
 			//It did! so first, must slice the segment
 			Point new_point;
 			new_point.point = res;
+
 			//make sure to interpolate UV too
 			new_point.uv = interpolate_uv(points[edges[i].points[0]].point, new_point.point, points[edges[i].points[1]].point, points[edges[i].points[0]].uv, points[edges[i].points[1]].uv);
 
@@ -507,6 +508,52 @@ void CSGBrushOperation::_collision_callback(const CSGBrush *A, int p_face_a, Map
 				over_count++;
 			else
 				under_count++;
+		}
+
+		// If faces are coplanar cut all edges
+		if (in_plane_count == 3) {
+			BuildPoly *poly_a = NULL;
+
+			if (!build_polys_a.has(p_face_a)) {
+
+				BuildPoly bp;
+				bp.create(A, p_face_a, mesh_merge, false);
+				build_polys_a[p_face_a] = bp;
+			}
+
+			poly_a = &build_polys_a[p_face_a];
+
+			BuildPoly *poly_b = NULL;
+
+			if (!build_polys_b.has(p_face_b)) {
+
+				BuildPoly bp;
+				bp.create(B, p_face_b, mesh_merge, true);
+				build_polys_b[p_face_b] = bp;
+			}
+
+			poly_b = &build_polys_b[p_face_b];
+
+			for(int i = 0; i < 3; i++) {
+				Vector2 segment[2];
+				for (int j = 0; j < 2; j++) {
+					Vector3 pp = poly_a->plane.project(B->faces[p_face_b].vertices[(i+j) % 3]);
+					pp = poly_a->to_poly.xform(pp);
+					segment[j] = Vector2(pp.x, pp.y);
+				}
+				poly_a->_clip_segment(B, p_face_b, segment,  mesh_merge, false);
+			}
+			for(int i = 0; i < 3; i++) {
+				Vector2 segment[2];
+				for (int j = 0; j < 2; j++) {
+					Vector3 pp = poly_b->plane.project(A->faces[p_face_a].vertices[(i+j) % 3]);
+					pp = poly_b->to_poly.xform(pp);
+					segment[j] = Vector2(pp.x, pp.y);
+				}
+				poly_b->_clip_segment(A, p_face_a, segment,  mesh_merge, false);
+			}
+
+			return;
 		}
 
 		if (over_count == 0 || under_count == 0)
@@ -999,8 +1046,8 @@ void CSGBrushOperation::_merge_poly(MeshMerge &mesh, int p_face_idx, const Build
 
 			for (int k = 0; k < 3; k++) {
 
-				Vector2 p = p_poly.points[polys[i].points[indices[j + k]]].point;
-				face[k] = p_poly.to_world.xform(Vector3(p.x, p.y, 0));
+				BuildPoly::Point p = p_poly.points[polys[i].points[indices[j + k]]];
+				face[k] = p_poly.to_world.xform(Vector3(p.point.x, p.point.y, 0));
 				uv[k] = p_poly.points[polys[i].points[indices[j + k]]].uv;
 			}
 
@@ -1071,6 +1118,118 @@ int CSGBrushOperation::MeshMerge::_create_bvh(BVH *p_bvh, BVH **p_bb, int p_from
 	_new->next = -1;
 
 	return index;
+}
+
+int CSGBrushOperation::MeshMerge::_bvh_find_face_in_b(BVH *bvhptr, int p_max_depth, int p_bvh_first, int p_face, bool &same_direction) const {
+
+	uint32_t *stack = (uint32_t *)alloca(sizeof(int) * p_max_depth);
+
+	enum {
+		TEST_AABB_BIT = 0,
+		VISIT_LEFT_BIT = 1,
+		VISIT_RIGHT_BIT = 2,
+		VISIT_DONE_BIT = 3,
+		VISITED_BIT_SHIFT = 29,
+		NODE_IDX_MASK = (1 << VISITED_BIT_SHIFT) - 1,
+		VISITED_BIT_MASK = ~NODE_IDX_MASK,
+
+	};
+
+	int level = 0;
+
+	const Vector3 *vertexptr = points.ptr();
+	const Face *facesptr = faces.ptr();
+	AABB face_aabb = bvhptr[p_face].aabb;
+	const Face &face_a = facesptr[p_face];
+	Face3 f3_a(vertexptr[face_a.points[0]], vertexptr[face_a.points[1]], vertexptr[face_a.points[2]]);
+
+	int pos = p_bvh_first;
+
+	stack[0] = pos;
+	while (true) {
+
+		uint32_t node = stack[level] & NODE_IDX_MASK;
+		const BVH &b = bvhptr[node];
+		bool done = false;
+
+		switch (stack[level] >> VISITED_BIT_SHIFT) {
+			case TEST_AABB_BIT: {
+
+				if (b.face >= 0) {
+
+					const BVH *bp = &b;
+
+					while (bp) {
+						//Polygons might be triangulated differently in different shapes, so as long as faces overlap, we can be sure that they are part of a coplanar polygon
+						if (face_aabb.intersects(bp->aabb) && facesptr[bp->face].from_b) {
+							Vector3 normalA = (points[faces[p_face].points[0]] - points[faces[p_face].points[2]]).cross(points[faces[p_face].points[0]] - points[faces[p_face].points[1]]);
+							Vector3 normalB = (points[faces[bp->face].points[0]] - points[faces[bp->face].points[2]]).cross(points[faces[bp->face].points[0]] - points[faces[bp->face].points[1]]);
+							if (normalA == normalB || normalA == (normalB*-1)) {
+								bool found = false;
+								for (int i = 0; i < 3; i++) {
+									Vector3 vertex = vertexptr[facesptr[bp->face].points[i]];
+									if (vertex == f3_a.get_closest_point_to(vertex)) {
+										found = true;
+										break;
+									}
+								}
+								if (found) {
+									if (normalA == normalB)
+										same_direction = true;
+									else
+										same_direction = false;
+									return bp->face;
+								}
+							}
+						}
+						if (bp->next != -1) {
+							bp = &bvhptr[bp->next];
+						} else {
+							bp = NULL;
+						}
+					}
+
+					stack[level] = (VISIT_DONE_BIT << VISITED_BIT_SHIFT) | node;
+
+				} else {
+					if (!b.aabb.intersects(face_aabb)) {
+						stack[level] = (VISIT_DONE_BIT << VISITED_BIT_SHIFT) | node;
+					} else {
+						stack[level] = (VISIT_LEFT_BIT << VISITED_BIT_SHIFT) | node;
+					}
+				}
+				continue;
+			}
+			case VISIT_LEFT_BIT: {
+
+				stack[level] = (VISIT_RIGHT_BIT << VISITED_BIT_SHIFT) | node;
+				stack[level + 1] = b.left | TEST_AABB_BIT;
+				level++;
+				continue;
+			}
+			case VISIT_RIGHT_BIT: {
+
+				stack[level] = (VISIT_DONE_BIT << VISITED_BIT_SHIFT) | node;
+				stack[level + 1] = b.right | TEST_AABB_BIT;
+				level++;
+				continue;
+			}
+			case VISIT_DONE_BIT: {
+
+				if (level == 0) {
+					done = true;
+					break;
+				} else
+					level--;
+				continue;
+			}
+		}
+
+		if (done)
+			break;
+	}
+
+	return -1;
 }
 
 int CSGBrushOperation::MeshMerge::_bvh_count_intersections(BVH *bvhptr, int p_max_depth, int p_bvh_first, const Vector3 &p_begin, const Vector3 &p_end, int p_exclude) const {
@@ -1183,7 +1342,7 @@ int CSGBrushOperation::MeshMerge::_bvh_count_intersections(BVH *bvhptr, int p_ma
 	return intersections;
 }
 
-void CSGBrushOperation::MeshMerge::mark_inside_faces() {
+void CSGBrushOperation::MeshMerge::mark_faces() {
 
 	// mark faces that are inside. This helps later do the boolean ops when merging.
 	// this approach is very brute force (with a bunch of optimizatios, such as BVH and pre AABB intersection test)
@@ -1246,7 +1405,6 @@ void CSGBrushOperation::MeshMerge::mark_inside_faces() {
 	bvhtrvec.resize(faces.size());
 	BVH **bvhptr = bvhtrvec.ptrw();
 	for (int i = 0; i < faces.size(); i++) {
-
 		bvhptr[i] = &bvh[i];
 	}
 
@@ -1254,10 +1412,24 @@ void CSGBrushOperation::MeshMerge::mark_inside_faces() {
 	int max_alloc = faces.size();
 	_create_bvh(bvh, bvhptr, 0, faces.size(), 1, max_depth, max_alloc);
 
+	int found_face = 0;
 	for (int i = 0; i < faces.size(); i++) {
+		//Try to find coplanar face
+		if (!faces[i].from_b) {
+			bool same_direction;
+			int i_other = _bvh_find_face_in_b(bvh, max_depth, max_alloc - 1,  i, same_direction);
+			if (i_other != -1) {
+				faces.write[i].face_property = same_direction ? Face::COPLANAR_SAME : Face::COPLANAR_OPPOSITE;
+				faces.write[i_other].face_property = same_direction ? Face::COPLANAR_SAME: Face::COPLANAR_OPPOSITE;
+				found_face++;
+				print_line("First: " + itos(i) + " Second: " + itos(i_other));
+				continue;
+			}
+		}
 
 		if (!intersection_aabb.intersects(bvh[i].aabb))
 			continue; //not in AABB intersection, so not in face intersection
+		// Test for intersections
 		Vector3 center = points[faces[i].points[0]];
 		center += points[faces[i].points[1]];
 		center += points[faces[i].points[2]];
@@ -1269,9 +1441,10 @@ void CSGBrushOperation::MeshMerge::mark_inside_faces() {
 		int intersections = _bvh_count_intersections(bvh, max_depth, max_alloc - 1, center, target, i);
 
 		if (intersections & 1) {
-			faces.write[i].inside = true;
+			faces.write[i].face_property = Face::INSIDE;
 		}
 	}
+	print_line("Found_face: " + itos(found_face));
 }
 
 void CSGBrushOperation::MeshMerge::add_face(const Vector3 &p_a, const Vector3 &p_b, const Vector3 &p_c, const Vector2 &p_uv_a, const Vector2 &p_uv_b, const Vector2 &p_uv_c, bool p_smooth, bool p_invert, const Ref<Material> &p_material, bool p_from_b) {
@@ -1301,7 +1474,7 @@ void CSGBrushOperation::MeshMerge::add_face(const Vector3 &p_a, const Vector3 &p
 
 	MeshMerge::Face face;
 	face.from_b = p_from_b;
-	face.inside = false;
+	face.face_property = MeshMerge::Face::OUTSIDE;
 	face.smooth = p_smooth;
 	face.invert = p_invert;
 	if (p_material.is_valid()) {
@@ -1393,9 +1566,12 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 		}
 		mesh_merge.add_face(points[0], points[1], points[2], uvs[0], uvs[1], uvs[2], p_B.faces[i].smooth, p_B.faces[i].invert, material, true);
 	}
+	for (int i = 0; i < mesh_merge.faces.size(); i++) {
+		print_line("Face (" + itos(i) + ") (" + mesh_merge.points[mesh_merge.faces[i].points[0]] + ") (" + mesh_merge.points[mesh_merge.faces[i].points[1]] + ") (" + mesh_merge.points[mesh_merge.faces[i].points[2]] + ") From B: " + itos(mesh_merge.faces[i].from_b));
+	}
 
-	//mark faces that ended up inside the intersection
-	mesh_merge.mark_inside_faces();
+	//mark faces that ended up inside the intersection or are coplanar
+	mesh_merge.mark_faces();
 
 	//regen new brush to start filling it again
 	result.clear();
@@ -1407,7 +1583,11 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			int outside_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-				if (mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_SAME && mesh_merge.faces[i].from_b)
+					continue;
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE)
+					continue;
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::INSIDE)
 					continue;
 
 				outside_count++;
@@ -1418,8 +1598,13 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			outside_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-				if (mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_SAME && mesh_merge.faces[i].from_b)
 					continue;
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE)
+					continue;
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::INSIDE)
+					continue;
+
 				for (int j = 0; j < 3; j++) {
 					result.faces.write[outside_count].vertices[j] = mesh_merge.points[mesh_merge.faces[i].points[j]];
 					result.faces.write[outside_count].uvs[j] = mesh_merge.faces[i].uvs[j];
@@ -1439,7 +1624,9 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			int inside_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-				if (!mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE
+						|| mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE
+						|| mesh_merge.faces[i].face_property == MeshMerge::Face::OUTSIDE)
 					continue;
 
 				inside_count++;
@@ -1450,8 +1637,11 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			inside_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-				if (!mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE
+						|| mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE
+						|| mesh_merge.faces[i].face_property == MeshMerge::Face::OUTSIDE)
 					continue;
+
 				for (int j = 0; j < 3; j++) {
 					result.faces.write[inside_count].vertices[j] = mesh_merge.points[mesh_merge.faces[i].points[j]];
 					result.faces.write[inside_count].uvs[j] = mesh_merge.faces[i].uvs[j];
@@ -1471,9 +1661,11 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			int face_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-				if (mesh_merge.faces[i].from_b && !mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].from_b && (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_SAME || mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE))
 					continue;
-				if (!mesh_merge.faces[i].from_b && mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].from_b && mesh_merge.faces[i].face_property == MeshMerge::Face::OUTSIDE)
+					continue;
+				if (!mesh_merge.faces[i].from_b && mesh_merge.faces[i].face_property == MeshMerge::Face::INSIDE)
 					continue;
 
 				face_count++;
@@ -1484,10 +1676,11 @@ void CSGBrushOperation::merge_brushes(Operation p_operation, const CSGBrush &p_A
 			face_count = 0;
 
 			for (int i = 0; i < mesh_merge.faces.size(); i++) {
-
-				if (mesh_merge.faces[i].from_b && !mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].from_b && (mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_SAME || mesh_merge.faces[i].face_property == MeshMerge::Face::COPLANAR_OPPOSITE))
 					continue;
-				if (!mesh_merge.faces[i].from_b && mesh_merge.faces[i].inside)
+				if (mesh_merge.faces[i].from_b && mesh_merge.faces[i].face_property == MeshMerge::Face::OUTSIDE)
+					continue;
+				if (!mesh_merge.faces[i].from_b && mesh_merge.faces[i].face_property == MeshMerge::Face::INSIDE)
 					continue;
 
 				for (int j = 0; j < 3; j++) {

@@ -108,6 +108,7 @@ struct CSGBrushOperation {
 		};
 
 		int _bvh_count_intersections(BVH *bvhptr, int p_max_depth, int p_bvh_first, const Vector3 &p_begin, const Vector3 &p_end, int p_exclude) const;
+		int _bvh_find_face_in_b(BVH *bvhptr, int p_max_depth, int p_bvh_first, int p_face, bool &same_direction) const;
 		int _create_bvh(BVH *p_bvh, BVH **p_bb, int p_from, int p_size, int p_depth, int &max_depth, int &max_alloc);
 
 		struct VertexKey {
@@ -144,7 +145,12 @@ struct CSGBrushOperation {
 
 		struct Face {
 			bool from_b;
-			bool inside;
+			enum FaceProperty {
+				OUTSIDE,
+				INSIDE,
+				COPLANAR_SAME,
+				COPLANAR_OPPOSITE
+			} face_property;
 			int points[3];
 			Vector2 uvs[3];
 			bool smooth;
@@ -161,7 +167,7 @@ struct CSGBrushOperation {
 		//		void add_face(const Vector3 &p_a, const Vector3 &p_b, const Vector3 &p_c, bool p_from_b);
 
 		float vertex_snap;
-		void mark_inside_faces();
+		void mark_faces();
 	};
 
 	struct BuildPoly {
